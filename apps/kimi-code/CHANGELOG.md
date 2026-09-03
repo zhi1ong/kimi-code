@@ -1,5 +1,17 @@
 # @moonshot-ai/kimi-code
 
+## 0.40.2
+
+### Patch Changes
+
+- [#3459](https://github.com/MoonshotAI/kimi-code/pull/3459) [`b6b9b37`](https://github.com/MoonshotAI/kimi-code/commit/b6b9b374dd5a3cda4257081b194760d7998e73f0) Thanks [@RealKai42](https://github.com/RealKai42)! - Subagent final messages are no longer bounced back for expansion when they are under 200 characters.
+
+- [#3473](https://github.com/MoonshotAI/kimi-code/pull/3473) [`d567a6a`](https://github.com/MoonshotAI/kimi-code/commit/d567a6a4fdaeb052deae9d9b313df0d922105799) Thanks [@7Sageer](https://github.com/7Sageer)! - Show a warning after switching to Ask When Needed or Never Ask mode.
+
+- [#3478](https://github.com/MoonshotAI/kimi-code/pull/3478) [`052e98e`](https://github.com/MoonshotAI/kimi-code/commit/052e98ec17ac8d931873ef892fb0e1912aa401e0) Thanks [@RealKai42](https://github.com/RealKai42)! - Resuming a subagent by its agent id now works after the session is reopened in a new process; the resumed subagent follows the current permission mode and is matched by its own profile in permission rules.
+
+- [#3461](https://github.com/MoonshotAI/kimi-code/pull/3461) [`8057d30`](https://github.com/MoonshotAI/kimi-code/commit/8057d30afbd2942f7c2e647f33a9dc7401af2b43) Thanks [@tpoisonooo](https://github.com/tpoisonooo)! - Tower mode (experimental, `KIMI_CODE_EXPERIMENTAL_TOWER=1`): fix tower mode never starting when enabled through `[experimental] tower = true` in `config.toml` instead of the environment variable. When tower mode cannot be enabled, the error now names the actual blocker — the disabled experiment, a required restart, or the owning session. When another live session owns the workspace tower, the message also names the owning session's title alongside its id. /tower now also works in a directory that is not a git repository — it runs git init and commits what is there (an empty initial commit for empty directories).
+
 ## 0.40.1
 
 ### Patch Changes
