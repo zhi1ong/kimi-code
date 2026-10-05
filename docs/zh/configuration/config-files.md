@@ -210,6 +210,8 @@ default_model = "kimi-code/kimi-for-coding-highspeed"
 | `force` | `boolean` | `false` | 把所有 subagent 固定到 `default_model`，收回 main agent 的选择权 |
 | `default_effort` | `string` | — | 每次派生的 subagent 绑定的 Thinking 档位，优先于所绑定模型自带的 `default_effort` |
 
+托管 `chat_title` 工具不可用或请求失败时，会话标题会自动通过本节的 `default_model` 生成，未配置时依次回退到 main agent 模型与全局默认模型。降级会使用所选供应商的 API 额度，并可能产生费用。
+
 字段之间的约束：
 
 - `default_model`：配置 `models` 表时必填，且必须是其中的 key。

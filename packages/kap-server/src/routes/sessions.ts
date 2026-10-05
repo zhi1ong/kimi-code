@@ -575,7 +575,7 @@ export function registerSessionsRoutes(
           reply.send(
             errEnvelope(
               ErrorCode.SESSION_TITLE_UNAVAILABLE,
-              'session title generation is unavailable (no managed OAuth login, no prompt yet, or the backend request failed)',
+              'session title generation is unavailable (no prompt yet, or managed generation is unavailable or failed and no usable fallback title was produced)',
               req.id,
             ),
           );

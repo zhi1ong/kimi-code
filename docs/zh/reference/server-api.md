@@ -560,7 +560,7 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 | `GET /api/v1/sessions/{session_id}` | 读取单个会话 |
 | `GET /api/v1/sessions/{session_id}/profile` | 读取会话档案 |
 | `POST /api/v1/sessions/{session_id}/profile` | 更新标题、元数据、Agent 配置 |
-| `POST /api/v1/sessions/{session_id}/title/generate` | 通过托管的 `chat_title` 工具生成标题 |
+| `POST /api/v1/sessions/{session_id}/title/generate` | 通过托管 `chat_title` 工具或模型降级生成会话标题 |
 | `POST /api/v1/sessions/{session_id}:{action}` | 会话动作：`fork` / `compact` / `undo` / `abort` / `btw` / `archive` / `restore` |
 | `GET /api/v1/sessions/{session_id}/children` | 列出子会话 |
 | `POST /api/v1/sessions/{session_id}/children` | 创建子会话（fork 并打标） |
@@ -689,7 +689,9 @@ schema 还接受 `agent_config` 内的 `system_prompt`、`tools`、`mcp_servers`
 
 #### `POST /api/v1/sessions/{session_id}/title/generate`
 
-通过托管供应商的 `chat_title` 工具根据会话的提示词生成标题并应用，同时广播 `session.meta.updated`。生成需要托管 OAuth 登录；未提供 `force` 时，已有自定义标题或已生成标题的会话会上报为不可用，而不会被覆盖。
+根据会话的提示词生成标题并应用，同时广播 `session.meta.updated`。优先使用托管供应商的 `chat_title` 工具；托管 OAuth 登录不可用或请求失败时，自动降级为一次模型补全，模型取自 [`[secondary_model]`](../configuration/config-files.md#secondary_model) 的 `default_model`，未配置时依次回退到 main agent 模型与全局默认模型。未提供 `force` 时，已有自定义标题或已生成标题的会话会上报为不可用，而不会被覆盖。
+
+降级会使用所选供应商的 API 额度，并可能产生费用。
 
 | 参数 | 位置 | 类型 | 说明 |
 | --- | --- | --- | --- |
@@ -700,7 +702,7 @@ schema 还接受 `agent_config` 内的 `system_prompt`、`tools`、`mcp_servers`
 成功时，`data` 为 `{ title }`——当前应用到会话的标题。
 
 - `40401`：会话不存在
-- `40923`：生成不可用——开关未开启、没有托管 OAuth 登录或尚无任何提示词内容、已有标题但未提供 `force`，或后端请求失败
+- `40923`：生成不可用——尚无任何提示词内容、已有标题但未提供 `force`，或托管生成不可用或失败且降级未能生成有效标题
 
 #### `POST /api/v1/sessions/{session_id}:{action}`
 

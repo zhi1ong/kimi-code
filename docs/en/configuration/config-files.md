@@ -210,6 +210,8 @@ default_model = "kimi-code/kimi-for-coding-highspeed"
 | `force` | `boolean` | `false` | Pin every subagent to `default_model`, taking the choice away from the main agent |
 | `default_effort` | `string` | — | The thinking effort every spawned subagent binds with; outranks the bound model entry's own `default_effort` |
 
+When the managed `chat_title` tool is unavailable or its request fails, session title generation automatically uses this section's `default_model`, falling back to the main agent's model, then the global default model. This fallback uses the selected provider's API quota and may incur charges.
+
 Constraints between the fields:
 
 - `default_model`: required when a `models` table is configured, and must be one of its keys.

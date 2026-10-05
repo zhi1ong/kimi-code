@@ -560,7 +560,7 @@ These endpoints create, list, and inspect sessions, drive session-level actions 
 | `GET /api/v1/sessions/{session_id}` | Read one session |
 | `GET /api/v1/sessions/{session_id}/profile` | Read the session profile |
 | `POST /api/v1/sessions/{session_id}/profile` | Update title, metadata, agent config |
-| `POST /api/v1/sessions/{session_id}/title/generate` | Generate a title via the managed `chat_title` tool |
+| `POST /api/v1/sessions/{session_id}/title/generate` | Generate a session title via the managed `chat_title` tool or the model fallback |
 | `POST /api/v1/sessions/{session_id}:{action}` | Session actions: `fork` / `compact` / `undo` / `abort` / `btw` / `archive` / `restore` |
 | `GET /api/v1/sessions/{session_id}/children` | List child sessions |
 | `POST /api/v1/sessions/{session_id}/children` | Create a child session (fork with a tag) |
@@ -689,7 +689,9 @@ On success, `data` is the updated [session object](#the-session-object).
 
 #### `POST /api/v1/sessions/{session_id}/title/generate`
 
-Generates a title from the session's prompts through the managed provider's `chat_title` tool and applies it, broadcasting `session.meta.updated`. Generation requires the managed OAuth login; without `force`, a session that already has a custom or generated title is reported unavailable instead of being overwritten.
+Generates a title from the session's prompts and applies it, broadcasting `session.meta.updated`. It first uses the managed provider's `chat_title` tool; when the managed OAuth login is unavailable or the request fails, it automatically falls back to a one-shot completion on the configured model — [`[secondary_model]`](../configuration/config-files.md#secondary_model) `default_model` first, then the main agent's model, then the global default model. Without `force`, a session that already has a custom or generated title is reported unavailable instead of being overwritten.
+
+The fallback uses the selected provider's API quota and may incur charges.
 
 | Parameter | In | Type | Description |
 | --- | --- | --- | --- |
@@ -700,7 +702,7 @@ Generates a title from the session's prompts through the managed provider's `cha
 On success, `data` is `{ title }` — the title now applied to the session.
 
 - `40401`: session not found
-- `40923`: generation unavailable — the flag is off, there is no managed OAuth login or no prompt content yet, an existing title without `force`, or the backend request failed
+- `40923`: generation unavailable — no prompt content yet, an existing title without `force`, or managed generation is unavailable or failed and the fallback produces no usable title
 
 #### `POST /api/v1/sessions/{session_id}:{action}`
 
