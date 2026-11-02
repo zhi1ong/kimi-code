@@ -7,13 +7,19 @@ import {
   resolveKimiCodeRuntimeAuth,
 } from '@moonshot-ai/kimi-code-oauth';
 
-import { ScopeActivation, registerScopedService } from '#/_base/di/scope';
+import { ScopeActivation, registerScopedService, type IAgentScopeHandle } from '#/_base/di/scope';
 import { LifecycleScope } from '#/app/scopes';
 import { ILogService } from '#/_base/log/log';
+import { IAgentProfileService } from '#/agent/profile/profile';
 import { IOAuthService } from '#/app/auth/auth';
 import { IEventService } from '#/app/event/event';
 import { IAgentLifecycleService, MAIN_AGENT_ID } from '#/session/agentLifecycle/agentLifecycle';
+import { createUserMessage } from '#human/llm/message';
+import { IModelCatalog, type Model } from '#/llm-adapter/model/catalog';
+import { generateModel, type ModelRequestParams } from '#/llm-adapter/model/generate';
+import type { ThinkingEffort } from '#human/llm-requester/thinking';
 import { IHostRequestHeaders } from '#/llm-adapter/model/host-request-headers';
+import { IProtocolAdapterRegistry } from '#/llm-adapter/protocol/protocol';
 import { IProviderService } from '#/llm-adapter/provider/provider';
 import { isOAuthCatalogVendor } from '#/llm-adapter/provider/provider-definition';
 import { ISessionContext } from '#/session/sessionContext/sessionContext';
@@ -22,8 +28,26 @@ import { SessionMetaUpdated } from '#/session/sessionMetadata/sessionMetaEvents'
 
 import { IAgentTitlePromptSource } from './agentTitlePromptSource';
 import { ISessionTitleService, type SessionTitleSource } from './sessionTitle';
+import { TITLE_SYSTEM_PROMPT } from './titlePrompt';
 
 const MAX_GENERATED_TITLE_LENGTH = 200;
+
+const TITLE_FALLBACK_TIMEOUT_MS = 20000;
+
+const TITLE_MAX_COMPLETION_TOKENS = 1024;
+
+const TITLE_RESPONSE_FORMAT = {
+  type: 'json_schema',
+  jsonSchema: {
+    name: 'session_title',
+    schema: {
+      type: 'object',
+      properties: { title: { type: 'string' } },
+      required: ['title'],
+      additionalProperties: false,
+    },
+  },
+} as const;
 
 const MAX_TITLE_INPUT_LENGTH = 1000;
 
@@ -52,6 +76,8 @@ export class SessionTitleService implements ISessionTitleService {
     @IProviderService private readonly providers: IProviderService,
     @IOAuthService private readonly oauth: IOAuthService,
     @IHostRequestHeaders private readonly hostHeaders: IHostRequestHeaders,
+    @IModelCatalog private readonly modelCatalog: IModelCatalog,
+    @IProtocolAdapterRegistry private readonly protocolRegistry: IProtocolAdapterRegistry,
     @ILogService private readonly log: ILogService,
   ) {}
 
@@ -84,22 +110,44 @@ export class SessionTitleService implements ISessionTitleService {
     const promptSource = main.accessor.get(IAgentTitlePromptSource);
     const input = await composeTitleInput(promptSource, source);
     if (input === undefined) return undefined;
-    return this.generateAndApply(input, force);
+    return this.generateAndApply(input, force, main);
   }
 
   private async generateAndApply(
     chatContent: string,
     force: boolean,
+    main: IAgentScopeHandle,
   ): Promise<string | undefined> {
     const current = await this.metadata.read();
     if (!force && current.titleKind === 'custom') return undefined;
+    const title = await this.requestTitle(chatContent, main);
+    if (title === undefined) return undefined;
+    const applied = await this.metadata.setGeneratedTitleIfUncustomized(title, { force });
+    if (!applied) return undefined;
+    this.eventService.publish(
+      new SessionMetaUpdated({
+        payload: {
+          agentId: 'main',
+          sessionId: this.ctx.sessionId,
+          title,
+          patch: { title, isCustomTitle: false },
+        },
+      }),
+    );
+    return title;
+  }
+
+  private async requestTitle(
+    chatContent: string,
+    main: IAgentScopeHandle,
+  ): Promise<string | undefined> {
     const provider = this.providers.get(KIMI_CODE_PROVIDER_NAME);
     if (
       provider === undefined ||
       !isOAuthCatalogVendor(provider.type) ||
       provider.oauth === undefined
     ) {
-      return undefined;
+      return this.generateTitleViaModel(chatContent, main);
     }
     const runtimeAuth = resolveKimiCodeRuntimeAuth({
       configuredBaseUrl: provider.baseUrl,
@@ -109,14 +157,14 @@ export class SessionTitleService implements ISessionTitleService {
       KIMI_CODE_PROVIDER_NAME,
       runtimeAuth.oauthRef,
     );
-    if (tokenProvider === undefined) return undefined;
+    if (tokenProvider === undefined) return this.generateTitleViaModel(chatContent, main);
     let token: string;
     try {
       token = await tokenProvider.getAccessToken();
     } catch (error) {
       if (!(error instanceof OAuthError)) throw error;
       this.log.debug(`chat_title request unavailable: ${error.message}`);
-      return undefined;
+      return this.generateTitleViaModel(chatContent, main);
     }
     const requestTitle = (accessToken: string) =>
       fetchChatTitle(kimiCodeToolsUrl(runtimeAuth.baseUrl), accessToken, chatContent, {
@@ -133,7 +181,7 @@ export class SessionTitleService implements ISessionTitleService {
       } catch (error) {
         if (!(error instanceof OAuthError)) throw error;
         this.log.debug(`chat_title request unavailable: ${error.message}`);
-        return undefined;
+        return this.generateTitleViaModel(chatContent, main);
       }
       result = await requestTitle(token);
     }
@@ -141,20 +189,49 @@ export class SessionTitleService implements ISessionTitleService {
       this.log.debug(`chat_title request failed: ${result.message}`);
       return undefined;
     }
-    const title = result.title.slice(0, MAX_GENERATED_TITLE_LENGTH);
-    const applied = await this.metadata.setGeneratedTitleIfUncustomized(title, { force });
-    if (!applied) return undefined;
-    this.eventService.publish(
-      new SessionMetaUpdated({
-        payload: {
-          agentId: 'main',
-          sessionId: this.ctx.sessionId,
-          title,
-          patch: { title, isCustomTitle: false },
+    return result.title.slice(0, MAX_GENERATED_TITLE_LENGTH);
+  }
+
+  private async generateTitleViaModel(
+    chatContent: string,
+    main: IAgentScopeHandle,
+  ): Promise<string | undefined> {
+    const modelId = main.accessor.get(IAgentProfileService).getModel();
+    if (modelId.length === 0) return undefined;
+    const controller = new AbortController();
+    const timer = setTimeout(() => {
+      controller.abort();
+    }, TITLE_FALLBACK_TIMEOUT_MS);
+    try {
+      const model = this.modelCatalog.get(modelId);
+      const params: ModelRequestParams = {
+        stream: false,
+        thinkingEffort: titleThinkingEffort(model),
+        maxCompletionTokens: TITLE_MAX_COMPLETION_TOKENS,
+      };
+      let text = '';
+      for await (const event of generateModel(
+        this.protocolRegistry.request(model, params),
+        {
+          systemPrompt: TITLE_SYSTEM_PROMPT,
+          tools: [],
+          messages: [createUserMessage(`<session>\n${chatContent}\n</session>`)],
+          responseFormat:
+            model.protocol === 'anthropic' ? TITLE_RESPONSE_FORMAT : { type: 'json_object' },
         },
-      }),
-    );
-    return title;
+        controller.signal,
+        params,
+      )) {
+        if (event.type === 'part' && event.part.type === 'text') text += event.part.text;
+      }
+      return normalizeModelTitle(text);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.log.debug(`session title model request failed: ${message}`);
+      return undefined;
+    } finally {
+      clearTimeout(timer);
+    }
   }
 }
 
@@ -215,6 +292,60 @@ function elideTitleDigestTurns(turns: readonly (readonly string[])[]): string | 
     budget -= cost;
   }
   return [...head, TITLE_DIGEST_ELISION_MARKER, ...tail].join('\n');
+}
+
+function titleThinkingEffort(model: Model): ThinkingEffort {
+  const reasoningEffort =
+    (model.protocol === 'openai' || model.protocol === 'openai_responses') &&
+    model.supportEfforts !== undefined &&
+    model.providerOptions?.offEffort === undefined;
+  if (model.providerOptions?.offEffort !== undefined) return 'off';
+  if (model.alwaysThinking || reasoningEffort) {
+    return (
+      model.supportEfforts?.find((effort) => effort !== 'off') ??
+      (model.protocol === 'anthropic' ? 'low' : 'on')
+    );
+  }
+  return 'off';
+}
+
+function normalizeModelTitle(text: string): string | undefined {
+  const trimmed = text.trim();
+  const fenced = trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i)?.[1]?.trim();
+  const payload = fenced ?? trimmed;
+  try {
+    const parsed: unknown = JSON.parse(payload);
+    const title = typeof parsed === 'string'
+      ? parsed
+      : typeof parsed === 'object' && parsed !== null && 'title' in parsed
+        ? parsed.title
+        : undefined;
+    if (typeof parsed === 'string' && typeof title === 'string' && title.trimStart().startsWith('{')) {
+      return normalizeModelTitle(title);
+    }
+    return normalizeTitleText(title);
+  } catch {
+    const match = trimmed.match(/"title"\s*:\s*"((?:\\.|[^"\\])*)"/);
+    if (match?.[1] !== undefined) {
+      try {
+        return normalizeTitleText(JSON.parse(`"${match[1]}"`));
+      } catch {
+      }
+    }
+    return normalizeTitleText(payload);
+  }
+}
+
+function normalizeTitleText(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const title = value.trim().split('\n')[0]?.trim();
+  if (title === undefined) return undefined;
+  for (const [open, close] of [['`', '`'], ['"', '"'], ["'", "'"], ['“', '”']] as const) {
+    if (title.startsWith(open) && title.endsWith(close) && title.length > open.length + close.length) {
+      return title.slice(open.length, -close.length).trim().slice(0, MAX_GENERATED_TITLE_LENGTH) || undefined;
+    }
+  }
+  return title.slice(0, MAX_GENERATED_TITLE_LENGTH) || undefined;
 }
 
 registerScopedService(
