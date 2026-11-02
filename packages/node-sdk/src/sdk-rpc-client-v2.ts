@@ -1668,7 +1668,7 @@ export class SDKRpcClientV2 extends SDKRpcClientBase {
    * v2-only (`ISessionTitleService`, session scope). Like `renameSession`, a
    * closed session is resumed, titled, and closed again so generation does
    * not leak a live session. `undefined` means generation was unavailable
-   * (no managed OAuth login, no prompt yet, or a custom title is set) — the
+   * (no usable model, no prompt yet, or a custom title is set) — the
    * current title is kept.
    */
   override async generateSessionTitle(

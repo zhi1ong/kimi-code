@@ -582,7 +582,7 @@ export function registerSessionsRoutes(app: SessionRouteHost, core: Scope, conve
         [ErrorCode.SESSION_TITLE_UNAVAILABLE]: {},
         ...sessionConflictErrors,
       },
-      description: 'Generate the session title via the managed chat_title tool',
+      description: 'Generate the session title via the managed tool or current model',
       tags: ['sessions'],
     },
     async (req, reply) => {
@@ -602,7 +602,7 @@ export function registerSessionsRoutes(app: SessionRouteHost, core: Scope, conve
           reply.send(
             errEnvelope(
               ErrorCode.SESSION_TITLE_UNAVAILABLE,
-              'session title generation is unavailable (no managed OAuth login, no prompt yet, or the backend request failed)',
+              'session title generation is unavailable (no usable model, no prompt yet, or title generation failed)',
               req.id,
             ),
           );

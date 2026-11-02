@@ -12,6 +12,13 @@ import { IEventService } from '#/app/event/event';
 import type { Event2 } from '#/app/event/event2';
 import { ITelemetryService } from '#/app/telemetry/telemetry';
 import { IHostRequestHeaders } from '#/llm-adapter/model/host-request-headers';
+import { IAgentProfileService } from '#/agent/profile/profile';
+import { IModelCatalog, type Model } from '#/llm-adapter/model/catalog';
+import { IProtocolAdapterRegistry } from '#/llm-adapter/protocol/protocol';
+import { ProtocolAdapterRegistry } from '#/llm-adapter/protocol/protocolAdapterRegistry';
+import type { LlmRequester } from '#human/llm-requester/requester';
+import { emptyUsage } from '#human/llm-requester/usage';
+
 import {
   IProviderService,
   type OAuthRef,
@@ -38,6 +45,7 @@ import {
 import { isUntitled } from '#/session/sessionMetadata/promptMetadata';
 import { SessionMetaUpdated } from '#/session/sessionMetadata/sessionMetaEvents';
 
+import { coreRequesterFromA } from '../../harness/scripted-generate';
 import { registerLogServices } from '../../_base/log/stubs';
 import { stubProviderService } from '../../app/provider/stubs';
 import { recordingTelemetry, type TelemetryRecord } from '../../app/telemetry/stubs';
@@ -141,6 +149,52 @@ function createPendingFetch() {
   };
 }
 
+function testModel(overrides: Partial<Model> = {}): Model {
+  return {
+    id: 'test-model',
+    name: 'test-model',
+    aliases: [],
+    protocol: 'openai',
+    baseUrl: 'https://model.example.test/v1',
+    headers: {},
+    capabilities: {
+      image_in: false,
+      video_in: false,
+      audio_in: false,
+      thinking: true,
+      tool_use: true,
+      max_context_tokens: 128000,
+    },
+    maxContextSize: 128000,
+    alwaysThinking: false,
+    providerName: 'test',
+    ...overrides,
+  };
+}
+
+function fakeTitleRequester(
+  calls: Array<{ stream?: boolean; thinking?: { effort: string }; responseFormat?: unknown }>,
+  output = JSON.stringify({ title: '模型标题' }),
+): LlmRequester {
+  return {
+    generate: (config, _content, control) => {
+      calls.push({
+        stream: config.stream,
+        thinking: config.thinking,
+        responseFormat: config.responseFormat,
+      });
+      control.onEvent?.({
+        type: 'llm.streaming.part',
+        part: { type: 'text', text: output },
+      });
+      control.onEvent?.({ type: 'llm.streaming.usage', usage: emptyUsage() });
+      control.onEvent?.({ type: 'llm.streaming.finish', finish: { finishReason: 'completed', rawFinishReason: 'stop' } });
+      control.onEvent?.({ type: 'llm.done' });
+      return Promise.resolve();
+    },
+  };
+}
+
 describe('SessionTitleService', () => {
   let disposables: DisposableStore;
   let ix: TestInstantiationService;
@@ -157,6 +211,14 @@ describe('SessionTitleService', () => {
   let turnExcerpt: TitleTurnExcerpt;
   let digestExcerpt: TitleDigestExcerpt;
   let tokenCalls: boolean[];
+  let mainModel: string;
+  let model: Model;
+  let modelOutput: string;
+  let modelCalls: Array<{
+    stream?: boolean;
+    thinking?: { effort: string };
+    responseFormat?: unknown;
+  }>;
 
   beforeEach(() => {
     tokenError = undefined;
@@ -167,6 +229,10 @@ describe('SessionTitleService', () => {
     turnExcerpt = {};
     digestExcerpt = { turns: [] };
     tokenCalls = [];
+    mainModel = '';
+    model = testModel();
+    modelOutput = JSON.stringify({ title: '模型标题' });
+    modelCalls = [];
     providers = { 'managed:kimi-code': MANAGED_PROVIDER };
     metadata = new FakeSessionMetadata();
     events = new FakeEventService();
@@ -204,7 +270,12 @@ describe('SessionTitleService', () => {
         const mainAgent: IAgentScopeHandle = {
           id: MAIN_AGENT_ID,
           kind: LifecycleScope.Agent,
-          accessor: { get: <T>() => promptSource as T },
+          accessor: {
+            get: <T>(identifier: unknown): T =>
+              (identifier === IAgentProfileService
+                ? { getModel: () => mainModel }
+                : promptSource) as T,
+          },
           dispose: () => undefined,
         };
         reg.definePartialInstance(IAgentLifecycleService, {
@@ -232,6 +303,14 @@ describe('SessionTitleService', () => {
           thirdPartyHeaders: {},
         });
         reg.defineInstance(ITelemetryService, recordingTelemetry(telemetry));
+        reg.definePartialInstance(IModelCatalog, { get: () => model });
+        reg.definePartialInstance(IProtocolAdapterRegistry, {
+          request: (requested, params) =>
+            coreRequesterFromA(
+              new ProtocolAdapterRegistry().request(requested, params),
+              fakeTitleRequester(modelCalls, modelOutput),
+            ),
+        });
         reg.define(ISessionTitleService, SessionTitleService);
       },
     });
@@ -420,12 +499,79 @@ describe('SessionTitleService', () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it('does nothing without a managed OAuth provider', async () => {
+  it('uses the current model without managed OAuth', async () => {
+    delete providers['managed:kimi-code'];
+    mainModel = 'test-model';
+    titlePrompts = ['帮我修一个 nil 指针'];
+
+    await expect(ix.get(ISessionTitleService).generateTitle()).resolves.toBe('模型标题');
+
+    expect(metadata.meta.title).toBe('模型标题');
+    expect(metadata.meta.titleKind).toBe('generated');
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(modelCalls).toHaveLength(1);
+    expect(modelCalls[0]).toMatchObject({
+      stream: false,
+      thinking: { effort: 'off' },
+      responseFormat: {
+        type: 'json_object',
+      },
+    });
+  });
+
+  it('returns unavailable without managed OAuth or a current model', async () => {
     delete providers['managed:kimi-code'];
     titlePrompts = ['hello'];
 
     await expect(ix.get(ISessionTitleService).generateTitle()).resolves.toBeUndefined();
     expect(fetchMock).not.toHaveBeenCalled();
+    expect(modelCalls).toHaveLength(0);
+  });
+
+  it('uses the lowest declared effort when thinking cannot be disabled', async () => {
+    delete providers['managed:kimi-code'];
+    mainModel = 'test-model';
+    model = testModel({ supportEfforts: ['low', 'medium', 'high'] });
+    titlePrompts = ['hello'];
+
+    await expect(ix.get(ISessionTitleService).generateTitle()).resolves.toBe('模型标题');
+
+    expect(modelCalls).toHaveLength(1);
+    expect(modelCalls[0]).toMatchObject({
+      stream: false,
+      thinking: { effort: 'low' },
+      responseFormat: {
+        type: 'json_object',
+      },
+    });
+  });
+
+  it.each([
+    ['a fenced JSON object', '```json\n{"title":"代码块标题"}\n```', '代码块标题'],
+    ['JSON wrapped in quotes', JSON.stringify(JSON.stringify({ title: '引号标题' })), '引号标题'],
+    ['text before JSON', '标题如下：\n{"title":"前缀标题"}', '前缀标题'],
+    ['a plain quoted title', '“普通标题”', '普通标题'],
+    ['a plain backtick title', '`反引号标题`', '反引号标题'],
+    ['quotes in the title', JSON.stringify({ title: 'Kimi 的 "Agent" 标题' }), 'Kimi 的 "Agent" 标题'],
+    ['a title field in malformed JSON', '{"title":"宽松标题"} extra', '宽松标题'],
+  ])('parses %s', async (_name, output, expected) => {
+    delete providers['managed:kimi-code'];
+    mainModel = 'test-model';
+    modelOutput = output;
+    titlePrompts = ['hello'];
+
+    await expect(ix.get(ISessionTitleService).generateTitle()).resolves.toBe(expected);
+  });
+
+  it('keeps the current title when the response is not a usable title', async () => {
+    delete providers['managed:kimi-code'];
+    mainModel = 'test-model';
+    modelOutput = '{"other":"not a title"}';
+    titlePrompts = ['hello'];
+    await metadata.update({ title: '保留标题', titleKind: 'replaceable' });
+
+    await expect(ix.get(ISessionTitleService).generateTitle()).resolves.toBeUndefined();
+    expect(metadata.meta.title).toBe('保留标题');
   });
 
   it('never overwrites a custom title set while generation is in flight', async () => {
@@ -636,31 +782,32 @@ describe('SessionTitleService', () => {
     expect(tokenCalls).toEqual([false, true]);
   });
 
-  it('degrades when the force refresh after a 401 fails', async () => {
+  it('uses the current model when the token refresh after a 401 fails', async () => {
     fetchMock.mockImplementationOnce(async () => new Response('', { status: 401 }));
     forceTokenError = new OAuthUnauthorizedError('refresh rejected');
+    mainModel = 'test-model';
     titlePrompts = ['hello'];
 
-    await expect(ix.get(ISessionTitleService).generateTitle()).resolves.toBeUndefined();
-    expect(metadata.meta.title).toBeUndefined();
+    await expect(ix.get(ISessionTitleService).generateTitle()).resolves.toBe('模型标题');
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(tokenCalls).toEqual([false, true]);
   });
 
-  it('returns unavailable when the OAuth token is missing or revoked', async () => {
+  it('uses the current model when the OAuth token is missing or revoked', async () => {
     tokenError = new OAuthUnauthorizedError('re-login required');
+    mainModel = 'test-model';
     titlePrompts = ['hello'];
 
-    const svc = ix.get(ISessionTitleService);
-    await expect(svc.generateTitle()).resolves.toBeUndefined();
+    await expect(ix.get(ISessionTitleService).generateTitle()).resolves.toBe('模型标题');
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it('returns unavailable when OAuth token retrieval has an operational failure', async () => {
+  it('uses the current model when OAuth token retrieval fails', async () => {
     tokenError = new OAuthConnectionError('connection failed');
+    mainModel = 'test-model';
     titlePrompts = ['hello'];
 
-    await expect(ix.get(ISessionTitleService).generateTitle()).resolves.toBeUndefined();
+    await expect(ix.get(ISessionTitleService).generateTitle()).resolves.toBe('模型标题');
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
